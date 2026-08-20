@@ -1,0 +1,46 @@
+# Obsidio: OPTIONAL compose file. You only need this if you attempt the
+# persistence bonus (see the scoring section of the detail page). The base
+# challenge is a single Dockerfile with no database and no compose.
+#
+# IMPORTANT: the 2 CPU / 2 GB budget is SHARED across every service here, not
+# granted per service. The split below is an EXAMPLE; tune it. Giving the
+# database too much starves your app; too little starves the database. That
+# tradeoff is exactly what the bonus is testing.
+#
+# The grader enforces the total 2 CPU / 2 GB cap on the whole compose project at
+# run time regardless of the numbers below, so these limits are your own
+# internal division of that fixed budget.
+
+services:
+  app:
+    # Change this to ../starters/python, ../starters/go, or ../starters/java
+    # when using a different language starter.
+    build: ../starters/node
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: "postgres://obsidio:obsidio@db:5432/obsidio"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1500M
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: obsidio
+      POSTGRES_PASSWORD: obsidio
+      POSTGRES_DB: obsidio
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 500M
+
+volumes:
+  dbdata:
