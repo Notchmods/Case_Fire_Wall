@@ -307,7 +307,7 @@ func main() {
 	d.Register("risk", riskWork, HandlerConfig{
 		Workers:   2,
 		QueueSize: 20,
-		Threshold: 1.45 * time.Second,
+		Threshold: 1490 * time.Millisecond,
 	})
 
 	// Health check bypasses the dispatcher. It must answer at once,
