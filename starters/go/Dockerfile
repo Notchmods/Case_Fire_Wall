@@ -4,11 +4,10 @@
 FROM golang:1.22-bookworm AS build
 WORKDIR /app
 COPY go.mod ./
-# Copy all .go source files (main.go; health.go is a leftover and excluded below)
 COPY main.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server .
 
-FROM debian:bookworm-slim
+FROM scratch
 COPY --from=build /app/server /server
 EXPOSE 8080
 CMD ["/server"]

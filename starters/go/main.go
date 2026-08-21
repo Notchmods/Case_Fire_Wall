@@ -51,14 +51,21 @@ const (
 	// One per CPU keeps the fast path responsive while fully utilising the box.
 	RISK_WORKERS = 2
 
-	// Buffered channel capacity: how many /risk jobs can queue before we start
-	// issuing 503s. Sized to absorb burst traffic while staying inside the
-	// 1 500 ms p95 latency budget.
-	//   budget  = RISK_QUEUE_CAP × avg_compute_time / RISK_WORKERS
-	//   1 400ms ≈ 14 × 100ms / 1  →  cap of 14 is safe at ~100ms compute.
-	// We set it conservatively at 20 to handle shorter compute times without
-	// filling too fast. The context deadline below provides a second safety net.
-	RISK_QUEUE_CAP = 20
+	// Buffered channel capacity: how many /risk jobs can queue before a new
+	// job has to wait behind the backlog. Sized so the WORST-CASE wait for a
+	// job at the back of the queue stays under RISK_DEADLINE, using measured
+	// compute time, not a guess:
+	//   worst_case_wait = RISK_QUEUE_CAP × avg_compute_time / RISK_WORKERS
+	// A real k6 run against the naive (unpooled) starter measured ~630ms
+	// average /risk compute time under load (up to ~4s at peak contention).
+	// With RISK_WORKERS=2 and a 1200ms deadline:
+	//   max_safe_cap ≈ RISK_DEADLINE × RISK_WORKERS / avg_compute_time
+	//                ≈ 1200 × 2 / 630 ≈ 3.8
+	// Set to 4: a job at the very back still finishes (or gets shed by the
+	// deadline) well inside budget instead of riding out the full 1200ms
+	// before failing. Retune this against a fresh k6 run on THIS branch —
+	// this is a reasoned starting point, not a measured final value.
+	RISK_QUEUE_CAP = 4
 
 	// Per-request deadline: if a /risk job hasn't started within this window,
 	// the handler returns 503 instead of continuing to wait.
