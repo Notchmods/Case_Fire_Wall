@@ -423,7 +423,7 @@ func main() {
 
 	//Manages pool of background processes (workers, size, and thresholds)
 	d := NewDispatcher()
-	
+
 	const ERROR_MARGIN = 0.1
 
 	// Price: CHEAP (weight 1). Many workers, short threshold time.
