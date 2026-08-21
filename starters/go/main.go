@@ -27,7 +27,7 @@ import (
 	"runtime"
 )
 
-//Prices of stocks that's cached in memory
+// Prices of stocks that's cached in memory
 var prices = map[string]float64{
 	"AAPL": 187.42, "GOOG": 141.80, "MSFT": 412.30, "AMZN": 178.10,
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
@@ -35,11 +35,8 @@ var prices = map[string]float64{
 
 var series = map[string][]float64{}
 
-//Limit to 2 requests for now (Subjected to change for experiment)
-var riskSlots=make(chan struct{}, 2) 
-
-
 func init() {
+	//Generate 500 data points for each stock.
 	for s, base := range prices {
 		arr := make([]float64, 500)
 		for i := 0; i < 500; i++ {
@@ -49,10 +46,31 @@ func init() {
 	}
 }
 
+// Risk Queue:
+type riskJob struct {
+	seed    string
+	results chan string
+}
 
+// Maximum number of risks waiting in queue (100 so far)
+var riskQueue = make(chan riskJob, 100)
 
+var processes = 50000
 
-//Write JSON requests
+const riskWorkers = 2
+
+func riskQ() {
+	for jobs := range riskQueue {
+		seeds := jobs.seed
+		for i := 0; i < processes; i++ {
+			sum := sha256.Sum256([]byte(seeds))
+			seeds = hex.EncodeToString(sum[:])
+		}
+		jobs.results <- seeds
+	}
+}
+
+// Write JSON requests
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -62,7 +80,11 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 func main() {
 
 	// Cap the process to 2 CPU's (feel free to comment this out if needed)
-	runtime.GOMAXPROCS(2) 
+	runtime.GOMAXPROCS(2)
+
+	for i := 0; i < riskWorkers; i++ {
+		go riskQ()
+	}
 
 	//Calling each handler function for each endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -100,7 +122,7 @@ func main() {
 				mx = v
 			}
 		}
-		
+
 		//Mean
 		mean := sum / n
 		varr := 0.0
@@ -119,14 +141,24 @@ func main() {
 		if seed == "" {
 			seed = "none"
 		}
-		h := seed
-		for i := 0; i < 50000; i++ {
-			sum := sha256.Sum256([]byte(h))
-			h = hex.EncodeToString(sum[:])
-		}
-		writeJSON(w, 200, map[string]interface{}{"seed": seed, "risk_hash": h})
-	})
 
+		job := riskJob{seed: seed, results: make(chan string, 1)}
+		select {
+		case riskQueue <- job:
+		case <-r.Context().Done():
+			return
+		default:
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "risk queue full"})
+			return
+		}
+
+		select {
+		case h := <-job.results:
+			writeJSON(w, 200, map[string]interface{}{"seed": seed, "risk_hash": h})
+		case <-r.Context().Done():
+			return
+		}
+	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -134,6 +166,3 @@ func main() {
 	}
 	http.ListenAndServe(":"+port, nil)
 }
-
-
-
