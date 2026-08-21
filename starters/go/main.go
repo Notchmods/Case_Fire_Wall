@@ -291,14 +291,14 @@ func main() {
 	d.Register("price", priceWork, HandlerConfig{
 		Workers:   8,
 		QueueSize: 200,
-		Threshold: 300 * time.Millisecond,
+		Threshold: 190 * time.Millisecond,
 	})
 
 	// Stats: MEDIUM (weight 3). Fewer workers, a middle threshold time.
 	d.Register("stats", statsWork, HandlerConfig{
 		Workers:   4,
 		QueueSize: 100,
-		Threshold: 600 * time.Millisecond,
+		Threshold: 490 * time.Millisecond,
 	})
 
 	// Risk: HEAVY (weight 10). Only 2 workers, matching the 2-CPU cap.
@@ -307,7 +307,7 @@ func main() {
 	d.Register("risk", riskWork, HandlerConfig{
 		Workers:   2,
 		QueueSize: 20,
-		Threshold: 2 * time.Second,
+		Threshold: 1.45 * time.Second,
 	})
 
 	// Health check bypasses the dispatcher. It must answer at once,
