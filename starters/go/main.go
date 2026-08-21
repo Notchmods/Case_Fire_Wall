@@ -27,7 +27,7 @@ import (
 	"runtime"
 )
 
-//Prices of stocks that's cached in memory
+// Prices of stocks that's cached in memory
 var prices = map[string]float64{
 	"AAPL": 187.42, "GOOG": 141.80, "MSFT": 412.30, "AMZN": 178.10,
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
@@ -35,9 +35,28 @@ var prices = map[string]float64{
 
 var series = map[string][]float64{}
 
-//Limit to 2 requests for now (Subjected to change for experiment)
-var riskSlots=make(chan struct{}, 2) 
+type statsJob struct {
+	symbol string
+	result chan statsResult
+}
 
+type statsResult struct {
+	code int
+	body map[string]interface{}
+}
+
+type riskJob struct {
+	seed   string
+	result chan riskResult
+}
+
+type riskResult struct {
+	code int
+	body map[string]interface{}
+}
+
+var statsQueue = make(chan statsJob, 1024)
+var riskQueue = make(chan riskJob, 64)
 
 func init() {
 	for s, base := range prices {
@@ -49,20 +68,72 @@ func init() {
 	}
 }
 
-
-
-
-//Write JSON requests
+// Write JSON requests
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
 
+func calculateStats(s string) statsResult {
+	arr, ok := series[s]
+	if !ok {
+		return statsResult{code: 404, body: map[string]interface{}{"error": "unknown symbol"}}
+	}
+
+	n := float64(len(arr))
+	sum, mn, mx := 0.0, arr[0], arr[0]
+	for _, v := range arr {
+		sum += v
+		if v < mn {
+			mn = v
+		}
+		if v > mx {
+			mx = v
+		}
+	}
+
+	mean := sum / n
+	varr := 0.0
+	for _, v := range arr {
+		varr += (v - mean) * (v - mean)
+	}
+	return statsResult{code: 200, body: map[string]interface{}{
+		"symbol": s, "mean": mean, "min": mn, "max": mx,
+		"stddev": math.Sqrt(varr / n),
+	}}
+}
+
+func calculateRisk(seed string) riskResult {
+	h := seed
+	for i := 0; i < 50000; i++ {
+		sum := sha256.Sum256([]byte(h))
+		h = hex.EncodeToString(sum[:])
+	}
+	return riskResult{code: 200, body: map[string]interface{}{"seed": seed, "risk_hash": h}}
+}
+
+func startWorkers() {
+	for i := 0; i < 2; i++ {
+		go func() {
+			for job := range statsQueue {
+				job.result <- calculateStats(job.symbol)
+			}
+		}()
+	}
+
+	go func() {
+		for job := range riskQueue {
+			job.result <- calculateRisk(job.seed)
+		}
+	}()
+}
+
 func main() {
 
 	// Cap the process to 2 CPU's (feel free to comment this out if needed)
-	runtime.GOMAXPROCS(2) 
+	runtime.GOMAXPROCS(2)
+	startWorkers()
 
 	//Calling each handler function for each endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -84,33 +155,15 @@ func main() {
 	//  Stats: MEDIUM (weight 3)
 	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		s := r.URL.Query().Get("symbol")
-		arr, ok := series[s]
-		if !ok {
-			writeJSON(w, 404, map[string]string{"error": "unknown symbol"})
-			return
+		result := make(chan statsResult, 1)
+		job := statsJob{symbol: s, result: result}
+		select {
+		case statsQueue <- job:
+			response := <-result
+			writeJSON(w, response.code, response.body)
+		default:
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "stats queue full"})
 		}
-		n := float64(len(arr))
-		sum, mn, mx := 0.0, arr[0], arr[0]
-		for _, v := range arr {
-			sum += v
-			if v < mn {
-				mn = v
-			}
-			if v > mx {
-				mx = v
-			}
-		}
-		
-		//Mean
-		mean := sum / n
-		varr := 0.0
-		for _, v := range arr {
-			varr += (v - mean) * (v - mean)
-		}
-		writeJSON(w, 200, map[string]interface{}{
-			"symbol": s, "mean": mean, "min": mn, "max": mx,
-			"stddev": math.Sqrt(varr / n),
-		})
 	})
 
 	// Risk HEAVY (weight 10): 50000 iterations of SHA-256 over the seed. Uncacheable.
@@ -119,14 +172,16 @@ func main() {
 		if seed == "" {
 			seed = "none"
 		}
-		h := seed
-		for i := 0; i < 50000; i++ {
-			sum := sha256.Sum256([]byte(h))
-			h = hex.EncodeToString(sum[:])
+		result := make(chan riskResult, 1)
+		job := riskJob{seed: seed, result: result}
+		select {
+		case riskQueue <- job:
+			response := <-result
+			writeJSON(w, response.code, response.body)
+		default:
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "risk queue full"})
 		}
-		writeJSON(w, 200, map[string]interface{}{"seed": seed, "risk_hash": h})
 	})
-
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -134,6 +189,3 @@ func main() {
 	}
 	http.ListenAndServe(":"+port, nil)
 }
-
-
-
