@@ -24,13 +24,20 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"runtime"
 )
 
+//Prices of stocks that's cached in memory
 var prices = map[string]float64{
 	"AAPL": 187.42, "GOOG": 141.80, "MSFT": 412.30, "AMZN": 178.10,
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
 }
+
 var series = map[string][]float64{}
+
+//Limit to 2 requests for now (Subjected to change for experiment)
+var riskSlots=make(chan struct{}, 2) 
+
 
 func init() {
 	for s, base := range prices {
@@ -42,6 +49,10 @@ func init() {
 	}
 }
 
+
+
+
+//Write JSON requests
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -49,12 +60,18 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 }
 
 func main() {
+
+	// Cap the process to 2 CPU's (feel free to comment this out if needed)
+	runtime.GOMAXPROCS(2) 
+
+	//Calling each handler function for each endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 
-	// CHEAP (weight 1)
+	// Price: CHEAP (weight 1)
 	http.HandleFunc("/price", func(w http.ResponseWriter, r *http.Request) {
+		//Get price via queries
 		s := r.URL.Query().Get("symbol")
 		p, ok := prices[s]
 		if !ok {
@@ -64,7 +81,7 @@ func main() {
 		writeJSON(w, 200, map[string]interface{}{"symbol": s, "price": p})
 	})
 
-	// MEDIUM (weight 3)
+	//  Stats: MEDIUM (weight 3)
 	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		s := r.URL.Query().Get("symbol")
 		arr, ok := series[s]
@@ -83,6 +100,8 @@ func main() {
 				mx = v
 			}
 		}
+		
+		//Mean
 		mean := sum / n
 		varr := 0.0
 		for _, v := range arr {
@@ -94,7 +113,7 @@ func main() {
 		})
 	})
 
-	// HEAVY (weight 10): 50000 iterations of SHA-256 over the seed. Uncacheable.
+	// Risk HEAVY (weight 10): 50000 iterations of SHA-256 over the seed. Uncacheable.
 	http.HandleFunc("/risk", func(w http.ResponseWriter, r *http.Request) {
 		seed := r.URL.Query().Get("seed")
 		if seed == "" {
@@ -108,9 +127,13 @@ func main() {
 		writeJSON(w, 200, map[string]interface{}{"seed": seed, "risk_hash": h})
 	})
 
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	http.ListenAndServe(":"+port, nil)
 }
+
+
+
