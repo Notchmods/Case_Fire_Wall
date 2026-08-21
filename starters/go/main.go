@@ -1,30 +1,3 @@
-// Obsidio: resilient Go analytics API.
-//
-// Architecture
-// ────────────
-// Go's net/http already dispatches each request to its own goroutine, so we
-// get concurrency on the fast path (/price, /stats) for free. The only
-// problem is /risk: 50 000 SHA-256 iterations are CPU-bound, and if every
-// goroutine runs them at once on a 2-CPU box they all compete and the fast
-// path suffers.
-//
-// Fix: a fixed worker pool of RISK_WORKERS goroutines sits in front of the
-// SHA-256 loop. Request handlers submit jobs via a buffered channel and block
-// until a worker finishes. This caps the number of simultaneous CPU-bound
-// computations to RISK_WORKERS regardless of how many HTTP goroutines are
-// waiting, leaving headroom for /price and /stats on the other core.
-//
-// Overflow guard: a context deadline of RISK_DEADLINE is attached to each
-// /risk job. If the job cannot start within that window (i.e. the pool is
-// too congested), the handler returns 503 immediately rather than waiting
-// forever. Fail-fast beats hanging: the k6 VU model means each VU blocks
-// while waiting, so fast refusals let VUs recycle and pick non-risk
-// endpoints, reducing overall congestion.
-//
-// Core-count note: the container is THROTTLED to 2 CPUs but can SEE all host
-// cores. GOMAXPROCS must be set explicitly, not derived from runtime.NumCPU().
-// Getting this wrong is exactly the gotcha the detail page warns about.
-
 package main
 
 import (
@@ -32,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"errors"
 	"math"
 	"net/http"
 	"os"
@@ -41,126 +14,192 @@ import (
 	"time"
 )
 
-// ── Constants ──────────────────────────────────────────────────────────────
+// ErrTimeout shows that a request did not finish in the threshold time.
+var ErrTimeout = errors.New("timeout: threshold time exceeded")
 
-const (
-	// Hard-coded to the container's 2-CPU cap — do NOT use runtime.NumCPU().
-	GOMAXPROCS = 2
+// ErrUnknownHandler shows that no handler has this name.
+var ErrUnknownHandler = errors.New("unknown handler name")
 
-	// Number of goroutines allowed to run the SHA-256 loop simultaneously.
-	// One per CPU keeps the fast path responsive while fully utilising the box.
-	RISK_WORKERS = 2
+// errUnknownSymbol shows that the stock symbol is not in our data.
+var errUnknownSymbol = errors.New("unknown symbol")
 
-	// Buffered channel capacity: how many /risk jobs can queue before a new
-	// job has to wait behind the backlog. Sized so the WORST-CASE wait for a
-	// job at the back of the queue stays under RISK_DEADLINE, using measured
-	// compute time, not a guess:
-	//   worst_case_wait = RISK_QUEUE_CAP × avg_compute_time / RISK_WORKERS
-	// A real k6 run against the naive (unpooled) starter measured ~630ms
-	// average /risk compute time under load (up to ~4s at peak contention).
-	// With RISK_WORKERS=2 and a 1200ms deadline:
-	//   max_safe_cap ≈ RISK_DEADLINE × RISK_WORKERS / avg_compute_time
-	//                ≈ 1200 × 2 / 630 ≈ 3.8
-	// Set to 4: a job at the very back still finishes (or gets shed by the
-	// deadline) well inside budget instead of riding out the full 1200ms
-	// before failing. Retune this against a fresh k6 run on THIS branch —
-	// this is a reasoned starting point, not a measured final value.
-	RISK_QUEUE_CAP = 4
+// HandleFunc does the work for one request.
+// It must check ctx and stop its work when ctx ends.
+type HandleFunc func(ctx context.Context, payload interface{}) (interface{}, error)
 
-	// Per-request deadline: if a /risk job hasn't started within this window,
-	// the handler returns 503 instead of continuing to wait.
-	// Set well below the 1 500 ms p95 budget so the deadline fires before k6
-	// measures a latency breach.
-	RISK_DEADLINE = 1200 * time.Millisecond
+// HandlerConfig sets the limits for one handle func.
+type HandlerConfig struct {
+	Workers   int           // number of workers that run this handle func
+	QueueSize int           // max number of requests that can wait in the queue
+	Threshold time.Duration // max time from submit to finish
+}
 
-	PORT = "8080"
-)
+// task is one request in a handler queue.
+type task struct {
+	ctx     context.Context
+	payload interface{}
+	result  chan taskResult
+}
 
-// ── Fixed data ─────────────────────────────────────────────────────────────
+type taskResult struct {
+	value interface{}
+	err   error
+}
 
-var pricesMu sync.RWMutex
+// handlerQueue holds the queue and the settings for one handle func.
+type handlerQueue struct {
+	fn        HandleFunc
+	queue     chan task
+	threshold time.Duration
+}
+
+// Dispatcher manages many handle funcs.
+// Each handle func has its own queue and its own threshold time.
+type Dispatcher struct {
+	mu       sync.RWMutex
+	handlers map[string]*handlerQueue
+	wg       sync.WaitGroup
+	quit     chan struct{}
+}
+
+// NewDispatcher makes a new, empty dispatcher.
+func NewDispatcher() *Dispatcher {
+	return &Dispatcher{
+		handlers: make(map[string]*handlerQueue),
+		quit:     make(chan struct{}),
+	}
+}
+
+// Register adds one handle func to the dispatcher.
+// Call Register before you call Submit for this name.
+func (d *Dispatcher) Register(name string, fn HandleFunc, cfg HandlerConfig) {
+	hq := &handlerQueue{
+		fn:        fn,
+		queue:     make(chan task, cfg.QueueSize),
+		threshold: cfg.Threshold,
+	}
+
+	d.mu.Lock()
+	d.handlers[name] = hq
+	d.mu.Unlock()
+
+	for i := 0; i < cfg.Workers; i++ {
+		d.wg.Add(1)
+		go d.worker(hq)
+	}
+}
+
+// worker takes tasks from one handler queue and runs them one at a time.
+func (d *Dispatcher) worker(hq *handlerQueue) {
+	defer d.wg.Done()
+	for {
+		select {
+		case <-d.quit:
+			return
+		case t := <-hq.queue:
+			// If the requester's time is already up, skip the work.
+			if t.ctx.Err() != nil {
+				continue
+			}
+			value, err := hq.fn(t.ctx, t.payload)
+			t.result <- taskResult{value: value, err: err}
+		}
+	}
+}
+
+// Submit sends one request to the named handle func.
+// Submit blocks until the request finishes, or until the threshold
+// time for that handle func runs out.
+// If the queue is full, or the work does not finish in time,
+// Submit returns ErrTimeout.
+func (d *Dispatcher) Submit(ctx context.Context, name string, payload interface{}) (interface{}, error) {
+	d.mu.RLock()
+	hq, ok := d.handlers[name]
+	d.mu.RUnlock()
+	if !ok {
+		return nil, ErrUnknownHandler
+	}
+
+	// This context sets one deadline for the whole request:
+	// the wait time in the queue plus the run time of the handle func.
+	reqCtx, cancel := context.WithTimeout(ctx, hq.threshold)
+	defer cancel()
+
+	t := task{
+		ctx:     reqCtx,
+		payload: payload,
+		result:  make(chan taskResult, 1),
+	}
+
+	select {
+	case hq.queue <- t:
+		// The request is now in the queue.
+	case <-reqCtx.Done():
+		return nil, translateErr(reqCtx.Err())
+	}
+
+	select {
+	case r := <-t.result:
+		return r.value, r.err
+	case <-reqCtx.Done():
+		return nil, translateErr(reqCtx.Err())
+	}
+}
+
+// translateErr turns a deadline error into ErrTimeout.
+// It keeps other errors, such as a parent context cancel, as they are.
+func translateErr(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrTimeout
+	}
+	return err
+}
+
+// Stop tells all workers to end.
+// Stop waits until every worker has ended.
+func (d *Dispatcher) Stop() {
+	close(d.quit)
+	d.wg.Wait()
+}
+
+// --- Application data ---
+
+// Prices of stocks that's cached in memory
 var prices = map[string]float64{
 	"AAPL": 187.42, "GOOG": 141.80, "MSFT": 412.30, "AMZN": 178.10,
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
 }
 
-// series is written once at startup and never mutated — safe for concurrent reads.
 var series = map[string][]float64{}
 
 func init() {
-	for sym, base := range prices {
+	for s, base := range prices {
 		arr := make([]float64, 500)
-		for i := range arr {
+		for i := 0; i < 500; i++ {
 			arr[i] = base * (1 + math.Sin(float64(i))/50)
 		}
-		series[sym] = arr
+		series[s] = arr
 	}
 }
 
-// ── Risk worker pool ───────────────────────────────────────────────────────
+// --- Handle funcs (the actual work, one per endpoint) ---
 
-// riskJob carries a seed in and receives the result (or an error) back.
-type riskJob struct {
-	seed   string
-	result chan<- string
-}
-
-// riskQueue is the bounded channel feeding the worker pool.
-var riskQueue = make(chan riskJob, RISK_QUEUE_CAP)
-
-// startRiskPool launches RISK_WORKERS goroutines that each drain riskQueue.
-// These goroutines run for the lifetime of the process.
-func startRiskPool() {
-	for i := 0; i < RISK_WORKERS; i++ {
-		go func() {
-			for job := range riskQueue {
-				h := job.seed
-				for j := 0; j < 50000; j++ {
-					sum := sha256.Sum256([]byte(h))
-					h = hex.EncodeToString(sum[:])
-				}
-				job.result <- h
-			}
-		}()
-	}
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
-}
-
-// ── Handlers ───────────────────────────────────────────────────────────────
-
-// GET /health — liveness check, not scored.
-func healthHandler(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// GET /price?symbol=SYM — cheap O(1) lookup.
-func priceHandler(w http.ResponseWriter, r *http.Request) {
-	sym := r.URL.Query().Get("symbol")
-	pricesMu.RLock()
-	p, ok := prices[sym]
-	pricesMu.RUnlock()
+// priceWork looks up one stock price. Weight 1, cheap.
+func priceWork(ctx context.Context, payload interface{}) (interface{}, error) {
+	s, _ := payload.(string)
+	p, ok := prices[s]
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown symbol"})
-		return
+		return nil, errUnknownSymbol
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"symbol": sym, "price": p})
+	return map[string]interface{}{"symbol": s, "price": p}, nil
 }
 
-// GET /stats?symbol=SYM — medium: O(500) computation per request.
-// Fast enough to run directly in the handler goroutine (microseconds).
-func statsHandler(w http.ResponseWriter, r *http.Request) {
-	sym := r.URL.Query().Get("symbol")
-	arr, ok := series[sym]
+// statsWork builds mean, min, max, and stddev for one stock. Weight 3, medium.
+func statsWork(ctx context.Context, payload interface{}) (interface{}, error) {
+	s, _ := payload.(string)
+	arr, ok := series[s]
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown symbol"})
-		return
+		return nil, errUnknownSymbol
 	}
 	n := float64(len(arr))
 	sum, mn, mx := 0.0, arr[0], arr[0]
@@ -173,109 +212,126 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			mx = v
 		}
 	}
+
 	mean := sum / n
-	variance := 0.0
+	varr := 0.0
 	for _, v := range arr {
-		d := v - mean
-		variance += d * d
+		varr += (v - mean) * (v - mean)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"symbol": sym,
-		"mean":   mean,
-		"min":    mn,
-		"max":    mx,
-		"stddev": math.Sqrt(variance / n),
-	})
+	return map[string]interface{}{
+		"symbol": s, "mean": mean, "min": mn, "max": mx,
+		"stddev": math.Sqrt(varr / n),
+	}, nil
 }
 
-// GET /risk?seed=VALUE — heavy: 50 000 SHA-256 iterations, offloaded to pool.
-func riskHandler(w http.ResponseWriter, r *http.Request) {
-	seed := r.URL.Query().Get("seed")
+// riskWork runs 50000 rounds of SHA-256 over the seed. Weight 10, heavy.
+// It checks ctx every 1000 rounds, so it can stop early once the
+// threshold time for this request has already run out.
+func riskWork(ctx context.Context, payload interface{}) (interface{}, error) {
+	seed, _ := payload.(string)
 	if seed == "" {
 		seed = "none"
 	}
-
-	// Per-request result channel (capacity 1 — non-blocking send from worker).
-	resultCh := make(chan string, 1)
-
-	job := riskJob{seed: seed, result: resultCh}
-
-	// Attach a deadline so we never wait longer than RISK_DEADLINE.
-	// If the queue is backed up beyond what the budget allows, return 503
-	// immediately rather than delivering a late (worthless) response.
-	ctx, cancel := context.WithTimeout(r.Context(), RISK_DEADLINE)
-	defer cancel()
-
-	select {
-	case riskQueue <- job:
-		// Job accepted; wait for the worker to finish.
-		select {
-		case hash := <-resultCh:
-			writeJSON(w, http.StatusOK, map[string]any{"seed": seed, "risk_hash": hash})
-		case <-ctx.Done():
-			// Worker took too long (queue drained slowly). Fail fast.
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "timeout, please retry"})
+	h := seed
+	for i := 0; i < 50000; i++ {
+		if i%1000 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-	case <-ctx.Done():
-		// Queue full and deadline already passed — reject immediately.
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "overloaded, please retry"})
+		sum := sha256.Sum256([]byte(h))
+		h = hex.EncodeToString(sum[:])
+	}
+	return map[string]interface{}{"seed": seed, "risk_hash": h}, nil
+}
+
+// --- HTTP wiring ---
+
+// writeJSON writes one JSON response.
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+// writeErr turns a handle func error into the right HTTP response.
+func writeErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server busy, try again later"})
+	case errors.Is(err, errUnknownSymbol):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown symbol"})
+	case errors.Is(err, context.Canceled):
+		// The client left already. There is no one left to answer.
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 }
 
-// POST /price — optional persistence bonus (naive in-memory; survives no restart).
-func priceUpdateHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		return
+// symbolHandler makes one HTTP handler for a symbol-based endpoint.
+// It reads the "symbol" query param, submits it to the named queue,
+// and writes back the result or the right error response.
+func symbolHandler(d *Dispatcher, queueName string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s := r.URL.Query().Get("symbol")
+		result, err := d.Submit(r.Context(), queueName, s)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	}
-	// Use *float64 so we can distinguish a missing field (nil) from an
-	// explicit 0 — Go's JSON decoder silently zero-fills missing numerics.
-	var body struct {
-		Symbol string   `json:"symbol"`
-		Price  *float64 `json:"price"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Symbol == "" || body.Price == nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol and numeric price required"})
-		return
-	}
-	pricesMu.Lock()
-	prices[body.Symbol] = *body.Price
-	pricesMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"symbol": body.Symbol, "price": *body.Price})
 }
-
-// ── Main ───────────────────────────────────────────────────────────────────
 
 func main() {
-	// Pin to the container's actual CPU cap — do NOT use runtime.NumCPU() here.
-	runtime.GOMAXPROCS(GOMAXPROCS)
-	log.Printf("GOMAXPROCS=%d  risk_workers=%d  queue_cap=%d  deadline=%s",
-		GOMAXPROCS, RISK_WORKERS, RISK_QUEUE_CAP, RISK_DEADLINE)
+	// Cap the process to 2 CPU's (feel free to comment this out if needed)
+	runtime.GOMAXPROCS(2)
 
-	startRiskPool()
+	d := NewDispatcher()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", healthHandler)
-	mux.HandleFunc("GET /price", priceHandler)
-	mux.HandleFunc("GET /stats", statsHandler)
-	mux.HandleFunc("GET /risk", riskHandler)
-	mux.HandleFunc("POST /price", priceUpdateHandler)
+	// Price: CHEAP (weight 1). Many workers, short threshold time.
+	d.Register("price", priceWork, HandlerConfig{
+		Workers:   8,
+		QueueSize: 200,
+		Threshold: 300 * time.Millisecond,
+	})
+
+	// Stats: MEDIUM (weight 3). Fewer workers, a middle threshold time.
+	d.Register("stats", statsWork, HandlerConfig{
+		Workers:   4,
+		QueueSize: 100,
+		Threshold: 600 * time.Millisecond,
+	})
+
+	// Risk: HEAVY (weight 10). Only 2 workers, matching the 2-CPU cap.
+	// The queue is small on purpose: once it fills, new requests fail
+	// fast with a 503 instead of piling up and starving /price and /stats.
+	d.Register("risk", riskWork, HandlerConfig{
+		Workers:   2,
+		QueueSize: 20,
+		Threshold: 2 * time.Second,
+	})
+
+	// Health check bypasses the dispatcher. It must answer at once,
+	// even while other queues are full.
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	http.HandleFunc("/price", symbolHandler(d, "price"))
+	http.HandleFunc("/stats", symbolHandler(d, "stats"))
+
+	http.HandleFunc("/risk", func(w http.ResponseWriter, r *http.Request) {
+		seed := r.URL.Query().Get("seed")
+		result, err := d.Submit(r.Context(), "risk", seed)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = PORT
+		port = "8080"
 	}
-
-	srv := &http.Server{
-		Addr:         ":" + port,
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	log.Printf("listening on :%s", port)
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
-	}
+	http.ListenAndServe(":"+port, nil)
 }
