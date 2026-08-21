@@ -221,18 +221,20 @@ func priceUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
+	// Use *float64 so we can distinguish a missing field (nil) from an
+	// explicit 0 — Go's JSON decoder silently zero-fills missing numerics.
 	var body struct {
-		Symbol string  `json:"symbol"`
-		Price  float64 `json:"price"`
+		Symbol string   `json:"symbol"`
+		Price  *float64 `json:"price"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Symbol == "" {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Symbol == "" || body.Price == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol and numeric price required"})
 		return
 	}
 	pricesMu.Lock()
-	prices[body.Symbol] = body.Price
+	prices[body.Symbol] = *body.Price
 	pricesMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"symbol": body.Symbol, "price": body.Price})
+	writeJSON(w, http.StatusOK, map[string]any{"symbol": body.Symbol, "price": *body.Price})
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
