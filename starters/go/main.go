@@ -6,13 +6,130 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"math"
 	"net/http"
 	"os"
 	"runtime"
 	"sync"
 	"time"
+
+	"database/sql"
 )
+
+// Database variables
+var db *sql.DB
+var pricesMu sync.RWMutex
+
+type PriceUpdate struct {
+	Symbol string  `json:"symbol"`
+	Price  float64 `json:"price"`
+}
+
+// Initialise database with Sqlite
+func initDatabase() error {
+	var err error
+
+	db, err = sql.Open("sqlite", "/data/prices.db")
+	if err != nil {
+		return err
+	}
+
+	if err := db.Ping(); err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS prices (
+			symbol TEXT PRIMARY KEY,
+			price REAL NOT NULL
+		)
+	`)
+
+	return err
+}
+
+func loadPersistedPrices() error {
+	rows, err := db.Query(`SELECT symbol, price FROM prices`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	pricesMu.Lock()
+	defer pricesMu.Unlock()
+
+	for rows.Next() {
+		var symbol string
+		var price float64
+
+		if err := rows.Scan(&symbol, &price); err != nil {
+			return err
+		}
+
+		prices[symbol] = price
+	}
+
+	return rows.Err()
+}
+
+func postPrice(w http.ResponseWriter, r *http.Request) {
+	var update PriceUpdate
+
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		writeJSON(
+			w,
+			http.StatusBadRequest,
+			map[string]string{"error": "invalid request"},
+		)
+		return
+	}
+
+	// Check that this symbol is valid.
+	pricesMu.RLock()
+	_, exists := prices[update.Symbol]
+	pricesMu.RUnlock()
+
+	if !exists {
+		writeJSON(
+			w,
+			http.StatusNotFound,
+			map[string]string{"error": "unknown symbol"},
+		)
+		return
+	}
+
+	// Persist FIRST.
+	_, err := db.Exec(`
+		INSERT INTO prices(symbol, price)
+		VALUES (?, ?)
+		ON CONFLICT(symbol)
+		DO UPDATE SET price = excluded.price
+	`, update.Symbol, update.Price)
+
+	if err != nil {
+		writeJSON(
+			w,
+			http.StatusInternalServerError,
+			map[string]string{"error": "database error"},
+		)
+		return
+	}
+
+	// Then update the fast in-memory version.
+	pricesMu.Lock()
+	prices[update.Symbol] = update.Price
+	pricesMu.Unlock()
+
+	writeJSON(
+		w,
+		http.StatusOK,
+		map[string]interface{}{
+			"symbol": update.Symbol,
+			"price":  update.Price,
+		},
+	)
+}
 
 // ErrTimeout shows that a request did not finish in the threshold time.
 var ErrTimeout = errors.New("timeout: threshold time exceeded")
@@ -187,7 +304,12 @@ func init() {
 // priceWork looks up one stock price. Weight 1, cheap.
 func priceWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	s, _ := payload.(string)
+
+	//Mutex
+	pricesMu.RLock()
 	p, ok := prices[s]
+	pricesMu.RUnlock()
+
 	if !ok {
 		return nil, errUnknownSymbol
 	}
@@ -285,6 +407,16 @@ func main() {
 	// Cap the process to 2 CPU's (feel free to comment this out if needed)
 	runtime.GOMAXPROCS(2)
 
+	if err := initDatabase(); err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := loadPersistedPrices(); err != nil {
+		log.Fatal(err)
+	}
+
+	//Manages pool of background processes (workers, size, and thresholds)
 	d := NewDispatcher()
 
 	// Price: CHEAP (weight 1). Many workers, short threshold time.
@@ -316,6 +448,24 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	priceGetHandler := symbolHandler(d, "price")
+
+	http.HandleFunc("/price", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			priceGetHandler(w, r)
+
+		case http.MethodPost:
+			postPrice(w, r)
+
+		default:
+			writeJSON(
+				w,
+				http.StatusMethodNotAllowed,
+				map[string]string{"error": "method not allowed"},
+			)
+		}
+	})
 	http.HandleFunc("/price", symbolHandler(d, "price"))
 	http.HandleFunc("/stats", symbolHandler(d, "stats"))
 
