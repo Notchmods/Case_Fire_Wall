@@ -24,15 +24,19 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"runtime"
 )
 
+// Prices of stocks that's cached in memory
 var prices = map[string]float64{
 	"AAPL": 187.42, "GOOG": 141.80, "MSFT": 412.30, "AMZN": 178.10,
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
 }
+
 var series = map[string][]float64{}
 
 func init() {
+	//Generate 500 data points for each stock.
 	for s, base := range prices {
 		arr := make([]float64, 500)
 		for i := 0; i < 500; i++ {
@@ -42,6 +46,31 @@ func init() {
 	}
 }
 
+// Risk Queue:
+type riskJob struct {
+	seed    string
+	results chan string
+}
+
+// Maximum number of risks waiting in queue (100 so far)
+var riskQueue = make(chan riskJob, 100)
+
+var processes = 50000
+
+const riskWorkers = 2
+
+func riskQ() {
+	for jobs := range riskQueue {
+		seeds := jobs.seed
+		for i := 0; i < processes; i++ {
+			sum := sha256.Sum256([]byte(seeds))
+			seeds = hex.EncodeToString(sum[:])
+		}
+		jobs.results <- seeds
+	}
+}
+
+// Write JSON requests
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -49,12 +78,22 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 }
 
 func main() {
+
+	// Cap the process to 2 CPU's (feel free to comment this out if needed)
+	runtime.GOMAXPROCS(2)
+
+	for i := 0; i < riskWorkers; i++ {
+		go riskQ()
+	}
+
+	//Calling each handler function for each endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 
-	// CHEAP (weight 1)
+	// Price: CHEAP (weight 1)
 	http.HandleFunc("/price", func(w http.ResponseWriter, r *http.Request) {
+		//Get price via queries
 		s := r.URL.Query().Get("symbol")
 		p, ok := prices[s]
 		if !ok {
@@ -64,7 +103,7 @@ func main() {
 		writeJSON(w, 200, map[string]interface{}{"symbol": s, "price": p})
 	})
 
-	// MEDIUM (weight 3)
+	//  Stats: MEDIUM (weight 3)
 	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		s := r.URL.Query().Get("symbol")
 		arr, ok := series[s]
@@ -83,6 +122,8 @@ func main() {
 				mx = v
 			}
 		}
+
+		//Mean
 		mean := sum / n
 		varr := 0.0
 		for _, v := range arr {
@@ -94,18 +135,29 @@ func main() {
 		})
 	})
 
-	// HEAVY (weight 10): 50000 iterations of SHA-256 over the seed. Uncacheable.
+	// Risk HEAVY (weight 10): 50000 iterations of SHA-256 over the seed. Uncacheable.
 	http.HandleFunc("/risk", func(w http.ResponseWriter, r *http.Request) {
 		seed := r.URL.Query().Get("seed")
 		if seed == "" {
 			seed = "none"
 		}
-		h := seed
-		for i := 0; i < 50000; i++ {
-			sum := sha256.Sum256([]byte(h))
-			h = hex.EncodeToString(sum[:])
+
+		job := riskJob{seed: seed, results: make(chan string, 1)}
+		select {
+		case riskQueue <- job:
+		case <-r.Context().Done():
+			return
+		default:
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "risk queue full"})
+			return
 		}
-		writeJSON(w, 200, map[string]interface{}{"seed": seed, "risk_hash": h})
+
+		select {
+		case h := <-job.results:
+			writeJSON(w, 200, map[string]interface{}{"seed": seed, "risk_hash": h})
+		case <-r.Context().Done():
+			return
+		}
 	})
 
 	port := os.Getenv("PORT")
