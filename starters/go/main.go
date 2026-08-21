@@ -123,11 +123,13 @@ func startWorkers() {
 		}()
 	}
 
-	go func() {
-		for job := range riskQueue {
-			job.result <- calculateRisk(job.seed)
-		}
-	}()
+	for i := 0; i < 2; i++ {
+		go func() {
+			for job := range riskQueue {
+				job.result <- calculateRisk(job.seed)
+			}
+		}()
+	}
 }
 
 func main() {
