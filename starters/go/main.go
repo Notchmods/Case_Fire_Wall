@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 )
@@ -56,7 +57,7 @@ type riskResult struct {
 }
 
 var statsQueue = make(chan statsJob, 1024)
-var riskQueue = make(chan riskJob, 64)
+var riskQueue = make(chan riskJob, 32)
 
 func init() {
 	for s, base := range prices {
@@ -114,7 +115,7 @@ func calculateRisk(seed string) riskResult {
 }
 
 func startWorkers() {
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 8; i++ {
 		go func() {
 			for job := range statsQueue {
 				job.result <- calculateStats(job.symbol)
