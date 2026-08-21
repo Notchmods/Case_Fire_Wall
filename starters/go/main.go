@@ -56,8 +56,13 @@ type riskResult struct {
 	body map[string]interface{}
 }
 
-var statsQueue = make(chan statsJob, 1024)
-var riskQueue = make(chan riskJob, 32)
+const STATS_QUEUE_LEN = 16
+const STATS_WORKER_COUNT = 8
+const RISK_QUEUE_LEN = 32
+const RISK_WORKER_COUNT = 2
+
+var statsQueue = make(chan statsJob, STATS_QUEUE_LEN)
+var riskQueue = make(chan riskJob, RISK_QUEUE_LEN)
 
 func init() {
 	for s, base := range prices {
@@ -115,7 +120,7 @@ func calculateRisk(seed string) riskResult {
 }
 
 func startWorkers() {
-	for i := 0; i < 8; i++ {
+	for i := 0; i < STATS_WORKER_COUNT; i++ {
 		go func() {
 			for job := range statsQueue {
 				job.result <- calculateStats(job.symbol)
@@ -123,7 +128,7 @@ func startWorkers() {
 		}()
 	}
 
-	for i := 0; i < 2; i++ {
+	for i := 0; i < RISK_WORKER_COUNT; i++ {
 		go func() {
 			for job := range riskQueue {
 				job.result <- calculateRisk(job.seed)
@@ -160,13 +165,9 @@ func main() {
 		s := r.URL.Query().Get("symbol")
 		result := make(chan statsResult, 1)
 		job := statsJob{symbol: s, result: result}
-		select {
-		case statsQueue <- job:
-			response := <-result
-			writeJSON(w, response.code, response.body)
-		default:
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "stats queue full"})
-		}
+		statsQueue <- job
+		response := <-result
+		writeJSON(w, response.code, response.body)
 	})
 
 	// Risk HEAVY (weight 10): 50000 iterations of SHA-256 over the seed. Uncacheable.
@@ -177,13 +178,9 @@ func main() {
 		}
 		result := make(chan riskResult, 1)
 		job := riskJob{seed: seed, result: result}
-		select {
-		case riskQueue <- job:
-			response := <-result
-			writeJSON(w, response.code, response.body)
-		default:
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "risk queue full"})
-		}
+		riskQueue <- job
+		response := <-result
+		writeJSON(w, response.code, response.body)
 	})
 
 	port := os.Getenv("PORT")
