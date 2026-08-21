@@ -232,15 +232,20 @@ func riskWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	if seed == "" {
 		seed = "none"
 	}
-	h := seed
+	buf := make([]byte, hex.EncodedLen(sha256.Size)) // reused every round, no per-round alloc
+	h := []byte(seed)
 	for i := 0; i < 50000; i++ {
-		if i%1000 == 0 && ctx.Err() != nil {
-			return nil, ctx.Err()
+		if i%1000 == 0 {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			runtime.Gosched()
 		}
-		sum := sha256.Sum256([]byte(h))
-		h = hex.EncodeToString(sum[:])
+		sum := sha256.Sum256(h)
+		hex.Encode(buf, sum[:])
+		h = buf
 	}
-	return map[string]interface{}{"seed": seed, "risk_hash": h}, nil
+	return map[string]interface{}{"seed": seed, "risk_hash": string(h)}, nil
 }
 
 // --- HTTP wiring ---
@@ -286,19 +291,21 @@ func main() {
 	runtime.GOMAXPROCS(2)
 
 	d := NewDispatcher()
+	
+	const ERROR_MARGIN = 0.1
 
 	// Price: CHEAP (weight 1). Many workers, short threshold time.
 	d.Register("price", priceWork, HandlerConfig{
 		Workers:   8,
 		QueueSize: 200,
-		Threshold: 190 * time.Millisecond,
+		Threshold: (200 - (ERROR_MARGIN * 200)) * time.Millisecond,
 	})
 
 	// Stats: MEDIUM (weight 3). Fewer workers, a middle threshold time.
 	d.Register("stats", statsWork, HandlerConfig{
 		Workers:   4,
 		QueueSize: 100,
-		Threshold: 490 * time.Millisecond,
+		Threshold: (500 - (ERROR_MARGIN * 500)) * time.Millisecond,
 	})
 
 	// Risk: HEAVY (weight 10). Only 2 workers, matching the 2-CPU cap.
@@ -307,7 +314,7 @@ func main() {
 	d.Register("risk", riskWork, HandlerConfig{
 		Workers:   2,
 		QueueSize: 20,
-		Threshold: 1490 * time.Millisecond,
+		Threshold: (1500 - (ERROR_MARGIN * 1500)) * time.Millisecond,
 	})
 
 	// Health check bypasses the dispatcher. It must answer at once,
