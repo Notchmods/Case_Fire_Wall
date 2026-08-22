@@ -13,8 +13,6 @@ import (
 	"runtime"
 	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // Opening and creating database(if non-existent)
@@ -228,7 +226,7 @@ var prices = map[string]float64{
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
 }
 
-var pricesMu sync.RWMutex
+// var pricesMu sync.RWMutex
 var priceDBPath = "priceDB.json"
 
 var series = map[string][]float64{}

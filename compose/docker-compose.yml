@@ -18,30 +18,12 @@ services:
     build: ../starters/go
     ports:
       - "8080:8080"
-    depends_on:
-      - db
     environment:
-    PRICE_DB_PATH: /starters/go/priceDB.json
+      PRICE_DB_PATH: /starters/go/priceDB.json
     deploy:
       resources:
         limits:
-          cpus: "1.5"
-          memory: 1500M
-
-  db:
-    image: postgres:16-alpine
-    environment: 
-      DB_PATH: /database/amitdb.db
-      POSTGRES_USER: obsidio
-      POSTGRES_PASSWORD: obsidio
-      POSTGRES_DB: obsidio
-    volumes:
-      - dbdata:/
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 500M
-
+          cpus: "2"
+          memory: 2000M
 volumes:
   dbdata:
