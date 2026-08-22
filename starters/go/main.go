@@ -308,7 +308,6 @@ func priceWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	pricesMu.RLock()
 	defer pricesMu.RUnlock()
 	p, ok := prices[s]
-	pricesMu.RUnlock()
 	if !ok {
 		return nil, errUnknownSymbol
 	}
@@ -425,6 +424,9 @@ func priceHandler(d *Dispatcher) http.HandlerFunc {
 func main() {
 	// Cap the process to 2 CPU's (feel free to comment this out if needed)
 	runtime.GOMAXPROCS(2)
+	if configuredPath := os.Getenv("PRICE_DB_PATH"); configuredPath != "" {
+		priceDBPath = configuredPath
+	}
 
 	if err := loadPrices(); err != nil {
 		panic(err)
