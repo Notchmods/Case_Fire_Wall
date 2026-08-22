@@ -228,6 +228,9 @@ var prices = map[string]float64{
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
 }
 
+var pricesMu sync.RWMutex
+var priceDBPath = "priceDB.json"
+
 var series = map[string][]float64{}
 
 func init() {
@@ -240,12 +243,72 @@ func init() {
 	}
 }
 
+func loadPrices() error {
+	data, err := os.ReadFile(priceDBPath)
+	if errors.Is(err, os.ErrNotExist) || len(data) == 0 {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	stored := make(map[string]float64)
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return err
+	}
+
+	pricesMu.Lock()
+	for symbol, price := range stored {
+		if _, ok := prices[symbol]; ok {
+			prices[symbol] = price
+		}
+	}
+	pricesMu.Unlock()
+	return nil
+}
+
+func savePricesLocked() error {
+	data, err := json.MarshalIndent(prices, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(priceDBPath, append(data, '\n'), 0644)
+}
+
+type priceUpdate struct {
+	Symbol string  `json:"symbol"`
+	Price  float64 `json:"price"`
+}
+
+func updatePrice(w http.ResponseWriter, r *http.Request) {
+	var update priceUpdate
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil || update.Symbol == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid price update"})
+		return
+	}
+
+	pricesMu.Lock()
+	defer pricesMu.Unlock()
+	if _, ok := prices[update.Symbol]; !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown symbol"})
+		return
+	}
+	prices[update.Symbol] = update.Price
+	if err := savePricesLocked(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save price"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, update)
+}
+
 // --- Handle funcs (the actual work, one per endpoint) ---
 
 // priceWork looks up one stock price. Weight 1, cheap.
 func priceWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	s, _ := payload.(string)
 	pricesMu.RLock()
+	defer pricesMu.RUnlock()
 	p, ok := prices[s]
 	pricesMu.RUnlock()
 	if !ok {
@@ -346,27 +409,27 @@ func symbolHandler(d *Dispatcher, queueName string) http.HandlerFunc {
 	}
 }
 
+func priceHandler(d *Dispatcher) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			updatePrice(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET, POST")
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		symbolHandler(d, "price")(w, r)
+	}
+}
+
 func main() {
 	// Cap the process to 2 CPU's (feel free to comment this out if needed)
 	runtime.GOMAXPROCS(2)
 
-	//Database code
-	var err error
-	db, err = openDB(os.Getenv("DB_PATH")) // e.g. /data/prices.db from the volume
-	if err != nil {
+	if err := loadPrices(); err != nil {
 		panic(err)
-	}
-	// Load any previously-persisted prices over the seed defaults.
-	rows, err := db.Query(`SELECT symbol, price FROM prices`)
-	if err == nil {
-		for rows.Next() {
-			var s string
-			var p float64
-			if rows.Scan(&s, &p) == nil {
-				prices[s] = p
-			}
-		}
-		rows.Close()
 	}
 
 	d := NewDispatcher()
@@ -402,13 +465,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	http.HandleFunc("/price", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			postPriceHandler(w, r)
-			return
-		}
-		symbolHandler(d, "price")(w, r) // GET path, unchanged
-	})
+	http.HandleFunc("/price", priceHandler(d))
 	http.HandleFunc("/stats", symbolHandler(d, "stats"))
 
 	http.HandleFunc("/risk", func(w http.ResponseWriter, r *http.Request) {
