@@ -3,72 +3,17 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 )
-
-// Opening and creating database(if non-existent)
-func openDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
-	}
-	// Pragmas that matter under load on a capped box:
-	// WAL lets reads proceed during writes; NORMAL sync is durable-enough
-	// and far cheaper than FULL fsync on every commit.
-	if _, err := db.Exec(`
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;
-        PRAGMA busy_timeout=5000;
-    `); err != nil {
-		return nil, err
-	}
-	_, err = db.Exec(`
-        CREATE TABLE IF NOT EXISTS prices (
-            symbol TEXT PRIMARY KEY,
-            price  REAL NOT NULL
-        )
-    `)
-	return db, err
-}
-
-// Database struct with mutex for concurrent access
-var (
-	db       *sql.DB
-	pricesMu sync.RWMutex
-)
-
-// Write /POST price into database
-func postPriceHandler(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Symbol string  `json:"symbol"`
-		Price  float64 `json:"price"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Symbol == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request"})
-		return
-	}
-	_, err := db.Exec(
-		`INSERT INTO prices(symbol, price) VALUES(?, ?)
-		 ON CONFLICT(symbol) DO UPDATE SET price = excluded.price`,
-		body.Symbol, body.Price)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "write failed"})
-		return
-	}
-	pricesMu.Lock()
-	prices[body.Symbol] = body.Price
-	pricesMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]interface{}{"symbol": body.Symbol, "price": body.Price})
-}
 
 // ErrTimeout shows that a request did not finish in the threshold time.
 var ErrTimeout = errors.New("timeout: threshold time exceeded")
@@ -226,7 +171,7 @@ var prices = map[string]float64{
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
 }
 
-// var pricesMu sync.RWMutex
+var pricesMu sync.RWMutex
 var priceDBPath = "priceDB.json"
 
 var series = map[string][]float64{}
@@ -242,9 +187,16 @@ func init() {
 }
 
 func loadPrices() error {
+	if err := os.MkdirAll(filepath.Dir(priceDBPath), 0755); err != nil {
+		return err
+	}
+
 	data, err := os.ReadFile(priceDBPath)
 	if errors.Is(err, os.ErrNotExist) || len(data) == 0 {
-		return nil
+		pricesMu.RLock()
+		err := savePricesLocked()
+		pricesMu.RUnlock()
+		return err
 	}
 	if err != nil {
 		return err
@@ -454,7 +406,7 @@ func main() {
 	// The queue is small on purpose: once it fills, new requests fail
 	// fast with a 503 instead of piling up and starving /price and /stats.
 	d.Register("risk", riskWork, HandlerConfig{
-		Workers:   1,
+		Workers:   2,
 		QueueSize: 20,
 		Threshold: (1500 - (ERROR_MARGIN * 1500)) * time.Millisecond,
 	})
