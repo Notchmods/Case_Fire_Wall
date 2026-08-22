@@ -19,9 +19,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      PRICE_DB_PATH: /data/priceDB.json
+      PRICE_DB_PATH: /priceDB.json
     volumes:
-      - ../starters/go:/data
+      - ../starters/go/priceDB.json:/priceDB.json
     deploy:
       resources:
         limits:

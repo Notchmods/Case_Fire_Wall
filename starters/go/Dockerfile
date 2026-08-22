@@ -9,5 +9,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server .
 
 FROM scratch
 COPY --from=build /app/server /server
+COPY priceDB.json /priceDB.json
 EXPOSE 8080
 CMD ["/server"]
