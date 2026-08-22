@@ -9,23 +9,19 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 )
 
-// ErrTimeout shows that a request did not finish in the threshold time.
 var ErrTimeout = errors.New("timeout: threshold time exceeded")
 
-// ErrUnknownHandler shows that no handler has this name.
 var ErrUnknownHandler = errors.New("unknown handler name")
 
-// errUnknownSymbol shows that the stock symbol is not in our data.
 var errUnknownSymbol = errors.New("unknown symbol")
 
-// HandleFunc does the work for one request.
-// It must check ctx and stop its work when ctx ends.
+// HandleFunc does the work for one request
+// It must check ctx and stop its work when ctx ends
 type HandleFunc func(ctx context.Context, payload interface{}) (interface{}, error)
 
 // HandlerConfig sets the limits for one handle func.
@@ -35,7 +31,7 @@ type HandlerConfig struct {
 	Threshold time.Duration // max time from submit to finish
 }
 
-// task is one request in a handler queue.
+// task is one request in a handler queue
 type task struct {
 	ctx     context.Context
 	payload interface{}
@@ -47,15 +43,15 @@ type taskResult struct {
 	err   error
 }
 
-// handlerQueue holds the queue and the settings for one handle func.
+// handlerQueue holds the queue and the settings for one handle func
 type handlerQueue struct {
 	fn        HandleFunc
 	queue     chan task
 	threshold time.Duration
 }
 
-// Dispatcher manages many handle funcs.
-// Each handle func has its own queue and its own threshold time.
+// Dispatcher manages many handle funcs
+// Each handle func has its own queue and its own threshold time
 type Dispatcher struct {
 	mu       sync.RWMutex
 	handlers map[string]*handlerQueue
@@ -63,7 +59,6 @@ type Dispatcher struct {
 	quit     chan struct{}
 }
 
-// NewDispatcher makes a new, empty dispatcher.
 func NewDispatcher() *Dispatcher {
 	return &Dispatcher{
 		handlers: make(map[string]*handlerQueue),
@@ -71,8 +66,7 @@ func NewDispatcher() *Dispatcher {
 	}
 }
 
-// Register adds one handle func to the dispatcher.
-// Call Register before you call Submit for this name.
+// Register adds one handle func to the dispatcher, called before Submit
 func (d *Dispatcher) Register(name string, fn HandleFunc, cfg HandlerConfig) {
 	hq := &handlerQueue{
 		fn:        fn,
@@ -90,7 +84,7 @@ func (d *Dispatcher) Register(name string, fn HandleFunc, cfg HandlerConfig) {
 	}
 }
 
-// worker takes tasks from one handler queue and runs them one at a time.
+// Worker takes tasks from one handler queue and runs them one at a time
 func (d *Dispatcher) worker(hq *handlerQueue) {
 	defer d.wg.Done()
 	for {
@@ -98,7 +92,7 @@ func (d *Dispatcher) worker(hq *handlerQueue) {
 		case <-d.quit:
 			return
 		case t := <-hq.queue:
-			// If the requester's time is already up, skip the work.
+			// If timeout, skip work
 			if t.ctx.Err() != nil {
 				continue
 			}
@@ -108,11 +102,9 @@ func (d *Dispatcher) worker(hq *handlerQueue) {
 	}
 }
 
-// Submit sends one request to the named handle func.
-// Submit blocks until the request finishes, or until the threshold
-// time for that handle func runs out.
-// If the queue is full, or the work does not finish in time,
-// Submit returns ErrTimeout.
+// Submit sends one request to the named handle func
+// Submit blocks until the request finishes or until the threshold time for that handle func runs out
+// If the queue is full, or the work does not finish in time Submit returns ErrTimeout
 func (d *Dispatcher) Submit(ctx context.Context, name string, payload interface{}) (interface{}, error) {
 	d.mu.RLock()
 	hq, ok := d.handlers[name]
@@ -121,8 +113,7 @@ func (d *Dispatcher) Submit(ctx context.Context, name string, payload interface{
 		return nil, ErrUnknownHandler
 	}
 
-	// This context sets one deadline for the whole request:
-	// the wait time in the queue plus the run time of the handle func.
+	// Sets request deadline to the wait time in the queue plus the run time of the handle func
 	reqCtx, cancel := context.WithTimeout(ctx, hq.threshold)
 	defer cancel()
 
@@ -134,7 +125,7 @@ func (d *Dispatcher) Submit(ctx context.Context, name string, payload interface{
 
 	select {
 	case hq.queue <- t:
-		// The request is now in the queue.
+		// The request is now in queue
 	case <-reqCtx.Done():
 		return nil, translateErr(reqCtx.Err())
 	}
@@ -147,8 +138,7 @@ func (d *Dispatcher) Submit(ctx context.Context, name string, payload interface{
 	}
 }
 
-// translateErr turns a deadline error into ErrTimeout.
-// It keeps other errors, such as a parent context cancel, as they are.
+// Turns only DeadlineExceeded into ErrTimeout
 func translateErr(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ErrTimeout
@@ -156,23 +146,10 @@ func translateErr(err error) error {
 	return err
 }
 
-// Stop tells all workers to end.
-// Stop waits until every worker has ended.
-func (d *Dispatcher) Stop() {
-	close(d.quit)
-	d.wg.Wait()
-}
-
-// --- Application data ---
-
-// Prices of stocks that's cached in memory
 var prices = map[string]float64{
 	"AAPL": 187.42, "GOOG": 141.80, "MSFT": 412.30, "AMZN": 178.10,
 	"NVDA": 120.15, "META": 502.60, "TSLA": 244.70, "JPM": 198.35,
 }
-
-var pricesMu sync.RWMutex
-var priceDBPath = "priceDB.json"
 
 var series = map[string][]float64{}
 
@@ -186,79 +163,11 @@ func init() {
 	}
 }
 
-func loadPrices() error {
-	if err := os.MkdirAll(filepath.Dir(priceDBPath), 0755); err != nil {
-		return err
-	}
+// Handle funcs (endpoint work)
 
-	data, err := os.ReadFile(priceDBPath)
-	if errors.Is(err, os.ErrNotExist) || len(data) == 0 {
-		pricesMu.RLock()
-		err := savePricesLocked()
-		pricesMu.RUnlock()
-		return err
-	}
-	if err != nil {
-		return err
-	}
-
-	stored := make(map[string]float64)
-	if err := json.Unmarshal(data, &stored); err != nil {
-		return err
-	}
-
-	pricesMu.Lock()
-	for symbol, price := range stored {
-		if _, ok := prices[symbol]; ok {
-			prices[symbol] = price
-		}
-	}
-	pricesMu.Unlock()
-	return nil
-}
-
-func savePricesLocked() error {
-	data, err := json.MarshalIndent(prices, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(priceDBPath, append(data, '\n'), 0644)
-}
-
-type priceUpdate struct {
-	Symbol string  `json:"symbol"`
-	Price  float64 `json:"price"`
-}
-
-func updatePrice(w http.ResponseWriter, r *http.Request) {
-	var update priceUpdate
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil || update.Symbol == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid price update"})
-		return
-	}
-
-	pricesMu.Lock()
-	defer pricesMu.Unlock()
-	if _, ok := prices[update.Symbol]; !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown symbol"})
-		return
-	}
-	prices[update.Symbol] = update.Price
-	if err := savePricesLocked(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save price"})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, update)
-}
-
-// --- Handle funcs (the actual work, one per endpoint) ---
-
-// priceWork looks up one stock price. Weight 1, cheap.
+// Looks up one stock price
 func priceWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	s, _ := payload.(string)
-	pricesMu.RLock()
-	defer pricesMu.RUnlock()
 	p, ok := prices[s]
 	if !ok {
 		return nil, errUnknownSymbol
@@ -266,7 +175,7 @@ func priceWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	return map[string]interface{}{"symbol": s, "price": p}, nil
 }
 
-// statsWork builds mean, min, max, and stddev for one stock. Weight 3, medium.
+// Calculates the mean, min, max, and stddev for one stock
 func statsWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	s, _ := payload.(string)
 	arr, ok := series[s]
@@ -296,15 +205,13 @@ func statsWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	}, nil
 }
 
-// riskWork runs 50000 rounds of SHA-256 over the seed. Weight 10, heavy.
-// It checks ctx every 1000 rounds, so it can stop early once the
-// threshold time for this request has already run out.
+// Run 50000 rounds of SHA-256 over the seed, dynamically checking the context for cancellation.
 func riskWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	seed, _ := payload.(string)
 	if seed == "" {
 		seed = "none"
 	}
-	buf := make([]byte, hex.EncodedLen(sha256.Size)) // reused every round, no per-round alloc
+	buf := make([]byte, hex.EncodedLen(sha256.Size)) // reused every round, minimizing allocations
 	h := []byte(seed)
 	for i := 0; i < 50000; i++ {
 		if i%1000 == 0 {
@@ -320,16 +227,14 @@ func riskWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	return map[string]interface{}{"seed": seed, "risk_hash": string(h)}, nil
 }
 
-// --- HTTP wiring ---
-
-// writeJSON writes one JSON response.
+// Write one JSON response
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
 
-// writeErr turns a handle func error into the right HTTP response.
+// Turn handle func error into matching HTTP response
 func writeErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded):
@@ -337,15 +242,13 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, errUnknownSymbol):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown symbol"})
 	case errors.Is(err, context.Canceled):
-		// The client left already. There is no one left to answer.
+		// client request canceled
 	default:
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 }
 
-// symbolHandler makes one HTTP handler for a symbol-based endpoint.
-// It reads the "symbol" query param, submits it to the named queue,
-// and writes back the result or the right error response.
+// Handles endpoint request, queue allocation, and endpoint response
 func symbolHandler(d *Dispatcher, queueName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s := r.URL.Query().Get("symbol")
@@ -358,66 +261,41 @@ func symbolHandler(d *Dispatcher, queueName string) http.HandlerFunc {
 	}
 }
 
-func priceHandler(d *Dispatcher) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			updatePrice(w, r)
-			return
-		}
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", "GET, POST")
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		symbolHandler(d, "price")(w, r)
-	}
-}
-
 func main() {
 	// Cap the process to 2 CPU's (feel free to comment this out if needed)
 	runtime.GOMAXPROCS(2)
-	if configuredPath := os.Getenv("PRICE_DB_PATH"); configuredPath != "" {
-		priceDBPath = configuredPath
-	}
-
-	if err := loadPrices(); err != nil {
-		panic(err)
-	}
 
 	d := NewDispatcher()
+	
+	const ERROR_MARGIN = 0.1 // 10% margin for threshold time, to account for scheduling delays
 
-	const ERROR_MARGIN = 0.1
-
-	// Price: CHEAP (weight 1). Many workers, short threshold time.
+	// /price endpoint queue
 	d.Register("price", priceWork, HandlerConfig{
 		Workers:   8,
 		QueueSize: 200,
 		Threshold: (200 - (ERROR_MARGIN * 200)) * time.Millisecond,
 	})
 
-	// Stats: MEDIUM (weight 3). Fewer workers, a middle threshold time.
+	// /stats endpoint queue
 	d.Register("stats", statsWork, HandlerConfig{
 		Workers:   4,
 		QueueSize: 100,
 		Threshold: (500 - (ERROR_MARGIN * 500)) * time.Millisecond,
 	})
 
-	// Risk: HEAVY (weight 10). Only 2 workers, matching the 2-CPU cap.
-	// The queue is small on purpose: once it fills, new requests fail
-	// fast with a 503 instead of piling up and starving /price and /stats.
+	// /risk endpoint queue
 	d.Register("risk", riskWork, HandlerConfig{
 		Workers:   2,
 		QueueSize: 20,
 		Threshold: (1500 - (ERROR_MARGIN * 1500)) * time.Millisecond,
 	})
 
-	// Health check bypasses the dispatcher. It must answer at once,
-	// even while other queues are full.
+	// /health, no queue as it is called once
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	http.HandleFunc("/price", priceHandler(d))
+	http.HandleFunc("/price", symbolHandler(d, "price"))
 	http.HandleFunc("/stats", symbolHandler(d, "stats"))
 
 	http.HandleFunc("/risk", func(w http.ResponseWriter, r *http.Request) {
