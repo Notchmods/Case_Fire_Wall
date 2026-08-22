@@ -15,7 +15,7 @@ services:
   app:
     # Change this to ../starters/python, ../starters/go, or ../starters/java
     # when using a different language starter.
-    build: ../starters/node
+    build: ../starters/go
     ports:
       - "8080:8080"
     depends_on:
