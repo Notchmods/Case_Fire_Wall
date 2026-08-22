@@ -5,7 +5,7 @@ FROM golang:1.22-bookworm AS build
 WORKDIR /app
 COPY go.mod ./
 COPY main.go ./
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server .
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o server .
 
 FROM scratch
 COPY --from=build /app/server /server
