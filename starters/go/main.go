@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"log"
 	"math"
 	"net/http"
 	"os"
@@ -14,121 +14,62 @@ import (
 	"sync"
 	"time"
 
-	"database/sql"
+	_ "modernc.org/sqlite"
 )
 
-// Database variables
-var db *sql.DB
-var pricesMu sync.RWMutex
-
-type PriceUpdate struct {
-	Symbol string  `json:"symbol"`
-	Price  float64 `json:"price"`
-}
-
-// Initialise database with Sqlite
-func initDatabase() error {
-	var err error
-
-	db, err = sql.Open("sqlite", "/data/prices.db")
+// Opening and creating database(if non-existent)
+func openDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	if err := db.Ping(); err != nil {
-		return err
+	// Pragmas that matter under load on a capped box:
+	// WAL lets reads proceed during writes; NORMAL sync is durable-enough
+	// and far cheaper than FULL fsync on every commit.
+	if _, err := db.Exec(`
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
+    `); err != nil {
+		return nil, err
 	}
-
 	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS prices (
-			symbol TEXT PRIMARY KEY,
-			price REAL NOT NULL
-		)
-	`)
-
-	return err
+        CREATE TABLE IF NOT EXISTS prices (
+            symbol TEXT PRIMARY KEY,
+            price  REAL NOT NULL
+        )
+    `)
+	return db, err
 }
 
-func loadPersistedPrices() error {
-	rows, err := db.Query(`SELECT symbol, price FROM prices`)
+// Database struct with mutex for concurrent access
+var (
+	db       *sql.DB
+	pricesMu sync.RWMutex
+)
+
+// Write /POST price into database
+func postPriceHandler(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Symbol string  `json:"symbol"`
+		Price  float64 `json:"price"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Symbol == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request"})
+		return
+	}
+	_, err := db.Exec(
+		`INSERT INTO prices(symbol, price) VALUES(?, ?)
+		 ON CONFLICT(symbol) DO UPDATE SET price = excluded.price`,
+		body.Symbol, body.Price)
 	if err != nil {
-		return err
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "write failed"})
+		return
 	}
-	defer rows.Close()
-
 	pricesMu.Lock()
-	defer pricesMu.Unlock()
-
-	for rows.Next() {
-		var symbol string
-		var price float64
-
-		if err := rows.Scan(&symbol, &price); err != nil {
-			return err
-		}
-
-		prices[symbol] = price
-	}
-
-	return rows.Err()
-}
-
-func postPrice(w http.ResponseWriter, r *http.Request) {
-	var update PriceUpdate
-
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		writeJSON(
-			w,
-			http.StatusBadRequest,
-			map[string]string{"error": "invalid request"},
-		)
-		return
-	}
-
-	// Check that this symbol is valid.
-	pricesMu.RLock()
-	_, exists := prices[update.Symbol]
-	pricesMu.RUnlock()
-
-	if !exists {
-		writeJSON(
-			w,
-			http.StatusNotFound,
-			map[string]string{"error": "unknown symbol"},
-		)
-		return
-	}
-
-	// Persist FIRST.
-	_, err := db.Exec(`
-		INSERT INTO prices(symbol, price)
-		VALUES (?, ?)
-		ON CONFLICT(symbol)
-		DO UPDATE SET price = excluded.price
-	`, update.Symbol, update.Price)
-
-	if err != nil {
-		writeJSON(
-			w,
-			http.StatusInternalServerError,
-			map[string]string{"error": "database error"},
-		)
-		return
-	}
-
-	// Then update the fast in-memory version.
-	pricesMu.Lock()
-	prices[update.Symbol] = update.Price
+	prices[body.Symbol] = body.Price
 	pricesMu.Unlock()
-
-	writeJSON(
-		w,
-		http.StatusOK,
-		map[string]interface{}{
-			"symbol": update.Symbol,
-			"price":  update.Price,
-		},
-	)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"symbol": body.Symbol, "price": body.Price})
 }
 
 // ErrTimeout shows that a request did not finish in the threshold time.
@@ -304,12 +245,9 @@ func init() {
 // priceWork looks up one stock price. Weight 1, cheap.
 func priceWork(ctx context.Context, payload interface{}) (interface{}, error) {
 	s, _ := payload.(string)
-
-	//Mutex
 	pricesMu.RLock()
 	p, ok := prices[s]
 	pricesMu.RUnlock()
-
 	if !ok {
 		return nil, errUnknownSymbol
 	}
@@ -412,16 +350,25 @@ func main() {
 	// Cap the process to 2 CPU's (feel free to comment this out if needed)
 	runtime.GOMAXPROCS(2)
 
-	if err := initDatabase(); err != nil {
-		log.Fatal(err)
+	//Database code
+	var err error
+	db, err = openDB(os.Getenv("DB_PATH")) // e.g. /data/prices.db from the volume
+	if err != nil {
+		panic(err)
 	}
-	defer db.Close()
-
-	if err := loadPersistedPrices(); err != nil {
-		log.Fatal(err)
+	// Load any previously-persisted prices over the seed defaults.
+	rows, err := db.Query(`SELECT symbol, price FROM prices`)
+	if err == nil {
+		for rows.Next() {
+			var s string
+			var p float64
+			if rows.Scan(&s, &p) == nil {
+				prices[s] = p
+			}
+		}
+		rows.Close()
 	}
 
-	//Manages pool of background processes (workers, size, and thresholds)
 	d := NewDispatcher()
 
 	const ERROR_MARGIN = 0.1
@@ -444,7 +391,7 @@ func main() {
 	// The queue is small on purpose: once it fills, new requests fail
 	// fast with a 503 instead of piling up and starving /price and /stats.
 	d.Register("risk", riskWork, HandlerConfig{
-		Workers:   2,
+		Workers:   1,
 		QueueSize: 20,
 		Threshold: (1500 - (ERROR_MARGIN * 1500)) * time.Millisecond,
 	})
@@ -455,25 +402,13 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	priceGetHandler := symbolHandler(d, "price")
-
 	http.HandleFunc("/price", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			priceGetHandler(w, r)
-
-		case http.MethodPost:
-			postPrice(w, r)
-
-		default:
-			writeJSON(
-				w,
-				http.StatusMethodNotAllowed,
-				map[string]string{"error": "method not allowed"},
-			)
+		if r.Method == http.MethodPost {
+			postPriceHandler(w, r)
+			return
 		}
+		symbolHandler(d, "price")(w, r) // GET path, unchanged
 	})
-	http.HandleFunc("/price", symbolHandler(d, "price"))
 	http.HandleFunc("/stats", symbolHandler(d, "stats"))
 
 	http.HandleFunc("/risk", func(w http.ResponseWriter, r *http.Request) {
