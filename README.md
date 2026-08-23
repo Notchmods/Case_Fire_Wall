@@ -20,10 +20,12 @@ curl.exe -X POST http://127.0.0.1:8080/price -H "Content-Type: application/json"
 POST /price records a price update that survives a container restart.  Updates are written to a JSON file on a mounted volume, with a mutex guarding concurrent writes and almost all latency threshold is passed.
 
 # Our approach:
-Every endpoint is served by its own isolated worker pool and bounded queue, sized to how expensive that endpoint is:   \
-/price — many workers, deep queue (cheap, absorbs bursts)   \
-/stats — fewer workers, medium queue  \
-/risk — exactly 2 workers (matching the 2-core cap), short queue  \
+Every endpoint is served by its own isolated worker pool and bounded queue, sized to how expensive that endpoint is:   
+```
+/price — many workers, deep queue (cheap, absorbs bursts)   
+/stats — fewer workers, medium queue  
+/risk — exactly 2 workers (matching the 2-core cap), short queue
+```
 Each the pools are separate therefore a flood of slow /risk requests can't starve the fast /price endpoint. Each request also carries a threshold trimmed by a 10% safety margin, so the server returns timeout call. Inside the /risk worker, the hash loop checks its deadline every 1,000 rounds and yields the core, so no single computation can hold a core hostage.  \
 
 The design choice, in one line: let the server say no quickly and cheaply, rather than accept unlimited work and slowly grind to a halt.
