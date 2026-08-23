@@ -10,21 +10,21 @@ The API server exposes 3 endpoints + a health check:
 /RISK- Performs N(N=50,000) chained SHA-256 hashing operations per request (Most expensive endpoint)
 
 # How to use each endpoints:
-curl http://127.0.0.1:8080/health #Check for health
-curl http://127.0.0.1:8080/price?symbol=AAPL  #Run /PRICE for APPL stock
-curl http://127.0.0.1:8080/stats?symbol=AAPL  #Run /STATS for APPL stock
-curl http://127.0.0.1:8080/risk?seed=0.48   #Run /RISK where 0.48 is the seed value
-curl.exe -X POST http://127.0.0.1:8080/price -H "Content-Type: application/json" -d '{\"symbol\":\"AAPL\",\"price\":999.99}'  #Changing value of price for Persistence Setup test
+curl http://127.0.0.1:8080/health #Check for health     \
+curl http://127.0.0.1:8080/price?symbol=AAPL  #Run /PRICE for APPL stock   \
+curl http://127.0.0.1:8080/stats?symbol=AAPL  #Run /STATS for APPL stock   \
+curl http://127.0.0.1:8080/risk?seed=0.48   #Run /RISK where 0.48 is the seed value   \
+curl.exe -X POST http://127.0.0.1:8080/price -H "Content-Type: application/json" -d '{\"symbol\":\"AAPL\",\"price\":999.99}'  #Changing value of price for Persistence Setup test   \
 
 # Persistence (BONUS)
 POST /price records a price update that survives a container restart.  Updates are written to a JSON file on a mounted volume, with a mutex guarding concurrent writes and almost all latency threshold is passed.
 
 # Our approach:
-Every endpoint is served by its own isolated worker pool and bounded queue, sized to how expensive that endpoint is:
-/price — many workers, deep queue (cheap, absorbs bursts)
-/stats — fewer workers, medium queue
-/risk — exactly 2 workers (matching the 2-core cap), short queue
-Each the pools are separate therefore a flood of slow /risk requests can't starve the fast /price endpoint. Each request also carries a threshold trimmed by a 10% safety margin, so the server returns timeout call. Inside the /risk worker, the hash loop checks its deadline every 1,000 rounds and yields the core, so no single computation can hold a core hostage.
+Every endpoint is served by its own isolated worker pool and bounded queue, sized to how expensive that endpoint is:   \
+/price — many workers, deep queue (cheap, absorbs bursts)   \
+/stats — fewer workers, medium queue  \
+/risk — exactly 2 workers (matching the 2-core cap), short queue  \
+Each the pools are separate therefore a flood of slow /risk requests can't starve the fast /price endpoint. Each request also carries a threshold trimmed by a 10% safety margin, so the server returns timeout call. Inside the /risk worker, the hash loop checks its deadline every 1,000 rounds and yields the core, so no single computation can hold a core hostage.  \
 
 The design choice, in one line: let the server say no quickly and cheaply, rather than accept unlimited work and slowly grind to a halt.
 
@@ -36,7 +36,7 @@ The design choice, in one line: let the server say no quickly and cheaply, rathe
 Build and run with the same 2 CPU / 2 GB limits the grader uses:
 
 ```
-cd starters/Go          # or Python, Node or Java (Strongest server is built with Go)
+cd starters/Go          # or Python, Node or Java (Strongest server is built with Go)  
 docker build -t obsidio .  #Build a Docker image (From Obsidio)
 docker run --rm --cpus=2 --memory=2g -p 8080:8080 obsidio   #Run the Docker file with a constraint of 2 CPU cores and 2GBof memory in port 8080
 ```
@@ -70,5 +70,5 @@ expected. Now go make it hold.
 -Go 1.2x (only if building outside Docker)
 
 # FAQ:
-Why did we chose Go?
+Why did we chose Go?   \
 Go's go-routine is what optimizes this project, resulting in genuine concurrency without fail.
