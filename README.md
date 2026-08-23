@@ -30,9 +30,6 @@ Each the pools are separate therefore a flood of slow /risk requests can't starv
 
 The design choice, in one line: let the server say no quickly and cheaply, rather than accept unlimited work and slowly grind to a halt.
 
-# Presentation slide:
-[Finalist pitch](https://canva.link/ynmznaip1os1bjk)
-
 ## Instruction to run this API server:
 
 Build and run with the same 2 CPU / 2 GB limits the grader uses:
@@ -70,6 +67,10 @@ expected. Now go make it hold.
 -Docker (with the ability to set --cpus and --memory limits)
 -k6 for load testing
 -Go 1.2x (only if building outside Docker)
+
+
+# Presentation slide:
+[Finalist pitch](https://canva.link/ynmznaip1os1bjk)
 
 # FAQ:
 Why did we chose Go?   \
