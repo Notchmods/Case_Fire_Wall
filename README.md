@@ -1,5 +1,5 @@
 # Case_Fire_Wall
-This project was built for a hackathon [Catalyst](https://cissa-unimelb.notion.site/Catalyst-2026-Track-Guide-3b199473577c8006ba1cc1be704b1eec) which was based off Track 2. This project reached the finalist stage.
+This project was built for the 2026 hackathon [Catalyst](https://cissa-unimelb.notion.site/Catalyst-2026-Track-Guide-3b199473577c8006ba1cc1be704b1eec) which was based off Track 2. This project reached the finalist stage.
 
 # Description
 The goal was to build a resilient API server that's fast even when loaded with traffic and must satisfy the constraints of 2GB of RAM and 2 CPU cores. The core challenge is that all endpoints share the same two cores. A naive server lets the expensive /risk requests fill up the calls until even the instant /price requested. 
