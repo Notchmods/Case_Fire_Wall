@@ -1,4 +1,4 @@
-# Case_Fire_Wall
+# Castle_Fire_Wall
 This project was built for the 2026 hackathon [Catalyst](https://cissa-unimelb.notion.site/Catalyst-2026-Track-Guide-3b199473577c8006ba1cc1be704b1eec) which was based off Track 2. This project reached the finalist stage.
 
 # Description
